@@ -20,6 +20,7 @@ missing_errors_doc = "allow"
 gl_bindings = { path = "crates/gl_bindings" }
 glfw = "0.54.0"
 anyhow = "1.0.79" 
+glam = "0.25.0"
 
 # handy utils
 log = "0.4.20"

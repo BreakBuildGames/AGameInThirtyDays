@@ -141,6 +141,7 @@ dependencies = [
  "anyhow",
  "env_logger",
  "gl_bindings",
+ "glam",
  "glfw",
  "log",
 ]
@@ -154,6 +155,12 @@ dependencies = [
  "image",
  "log",
 ]
+
+[[package]]
+name = "glam"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "151665d9be52f9bb40fc7966565d39666f2d1e69233571b71b87791c7e0528b3"
 
 [[package]]
 name = "glfw"
