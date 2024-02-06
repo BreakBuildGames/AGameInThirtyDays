@@ -1,8 +1,11 @@
-use std::mem::MaybeUninit;
+use std::{char, mem::MaybeUninit, ptr::addr_of};
 
 use gl_bindings::gl43::{
-    self as gl, AttributeComponents, BufferTarget, BufferUsage, ElementKind, VertexAttributeKind,
+    self as gl, AttributeComponents, Border, BufferTarget, BufferUsage, ElementKind,
+    InternalFormat, Primitive, SamplerParameterName, SamplerParameterValue, TextureDataFormat,
+    TextureFormat, TextureTarget, TextureUnit, VertexAttributeKind,
 };
+use glam::{vec2, vec3, vec4, Vec2};
 
 use crate::color32;
 
@@ -17,7 +20,10 @@ pub struct Renderer {
     vao: gl::VertexArray,
     vbo: gl::Buffer,
     ibo: gl::Buffer,
+    texture: gl::Texture,
+    sampler: gl::Sampler,
     program: gl::Program,
+    font: Font,
 }
 
 impl Drop for Renderer {
@@ -31,11 +37,13 @@ impl Drop for Renderer {
     }
 }
 
+const FONT: &[u8] = include_bytes!("../resources/montserrat.ttf");
+
 mod cube {
     #[rustfmt::skip]
     pub const VERTICES: &[f32] = &[
         //front
-       -0.5,  0.5, -0.5, //0: TL
+       0.5,  0.5, -0.5, //0: TL
        -0.5, -0.5, -0.5, //1: BL
         0.5,  0.5, -0.5, //2: TR
         0.5, -0.5, -0.5, //3: BR
@@ -101,6 +109,88 @@ fn create_shader_program(gl: &gl::Api, vextex_source: &str, fragment_source: &st
         gl.delete_shader(fs);
 
         program
+    }
+}
+
+struct Font {
+    glyphs: Vec<Glyph>,
+    font_size: f32,
+    white_space: f32,
+}
+
+struct Glyph {
+    position: Vec2,
+    bitmap_size: Vec2,
+    size: Vec2,
+    advance: Vec2,
+    offset: Vec2,
+    char: char,
+}
+
+impl Font {
+    pub const ATLAS_SIZE: usize = 1024;
+
+    pub fn glyph(&self, char: char) -> Option<&Glyph> {
+        self.glyphs.iter().find(|v| v.char == char)
+    }
+
+    pub fn load_font(
+        font_size: f32,
+        data: &[u8],
+        char_set: impl Iterator<Item = char>,
+    ) -> (Self, Vec<u8>) {
+        let font = fontdue::Font::from_bytes(data, fontdue::FontSettings::default()).unwrap();
+        let white_space = font.metrics(' ', font_size).advance_width;
+
+        let padding = 2;
+        let mut atlas = vec![0; Self::ATLAS_SIZE * Self::ATLAS_SIZE];
+
+        let mut pen_x = 0;
+        let mut pen_y = 0;
+
+        let mut glyphs = Vec::with_capacity(Self::ATLAS_SIZE);
+
+        for char in char_set {
+            let (metrics, pixel_data) = font.rasterize(char, font_size);
+
+            if pen_x + metrics.width > Self::ATLAS_SIZE {
+                pen_x = 0;
+                pen_y += font_size as usize;
+            }
+
+            for x in 0..metrics.width {
+                for y in 0..metrics.height {
+                    atlas[pen_x + x + ((pen_y + y) * Self::ATLAS_SIZE)] =
+                        pixel_data[x + y * metrics.width];
+                }
+            }
+
+            let uv_x = pen_x as f32 / Self::ATLAS_SIZE as f32;
+            let uv_y = pen_y as f32 / Self::ATLAS_SIZE as f32;
+
+            let width = (metrics.width) as f32 / Self::ATLAS_SIZE as f32;
+            let height = (metrics.height) as f32 / Self::ATLAS_SIZE as f32;
+
+            glyphs.push(Glyph {
+                position: vec2(uv_x, uv_y),
+                advance: vec2(metrics.advance_width, font_size),
+                bitmap_size: vec2(width, height),
+                size: vec2(metrics.width as f32, metrics.height as f32),
+                offset: vec2(metrics.xmin as f32, metrics.ymin as f32),
+                char,
+            });
+
+            pen_x += metrics.width + padding;
+        }
+        //TODO: single channl texture support
+        let data = atlas.into_iter().flat_map(|v| [v, v, v]).collect();
+        let font = Self {
+            font_size,
+            glyphs,
+            white_space: white_space as f32,
+        };
+
+        (font, data)
     }
 }
 
@@ -197,46 +287,111 @@ impl Renderer {
 
         let program = create_shader_program(&gl, VS, FS);
 
+        let (font, font_atlas) = Font::load_font(
+            72.0,
+            FONT,
+            ('a'..='z').chain('A'..='Z').chain(".,-_+/=()".chars()),
+        );
+
+        let (texture, sampler) = unsafe {
+            let mut texture = MaybeUninit::zeroed();
+            gl.gen_textures(1, texture.as_mut_ptr());
+            let texture = texture.assume_init();
+
+            gl.active_texture(TextureUnit::ZERO);
+            gl.bind_texture(TextureTarget::TEXTURE_2D, texture);
+            gl.tex_image_2d(
+                TextureTarget::TEXTURE_2D,
+                0,
+                InternalFormat::RGB8,
+                Font::ATLAS_SIZE.try_into().unwrap(),
+                Font::ATLAS_SIZE.try_into().unwrap(),
+                Border::ZERO,
+                TextureFormat::RGB,
+                TextureDataFormat::U8,
+                font_atlas.as_ptr().cast(),
+            );
+
+            let mut sampler = MaybeUninit::zeroed();
+            gl.gen_samplers(1, sampler.as_mut_ptr());
+            let sampler = sampler.assume_init();
+
+            gl.bind_sampler(0, sampler);
+            gl.sampler_parameter_i(
+                sampler,
+                SamplerParameterName::TEXTURE_MIN_FILTER,
+                SamplerParameterValue::LINEAR,
+            );
+
+            (texture, sampler)
+        };
+
         Ok(Self {
             gl,
             vao: vertex_array,
             vbo: vertex_buffer,
             ibo: index_buffer,
             program,
+            texture,
+            sampler,
+            font,
         })
     }
 
     pub fn update(&mut self, dt: f32) {
         let gl = &self.gl;
 
-        let m = glam::Mat4::from_euler(glam::EulerRot::XYZ, 0.0, dt, 0.0);
-        let view =
-            glam::Mat4::look_at_lh(glam::vec3(3.0, 3.0, 3.0), glam::Vec3::ZERO, glam::Vec3::Y);
+        let text = "The quick brown fox...";
 
-        let projection = glam::Mat4::perspective_lh(0.6, 16f32 / 9f32, 0.01, 100.0);
-        let view_projection = projection * view * m;
+        let projection = glam::Mat4::orthographic_lh(0.0, 1024.0, 768.0, 0.0, -0.01, -100.0);
+        let view = glam::Mat4::IDENTITY;
 
         unsafe {
             gl.clear(gl::ClearMask::ALL);
             gl.use_program(self.program);
+        }
 
-            gl.uniform_matrix4_fv(
-                0,
-                1,
-                gl::GLboolean::FALSE,
-                std::ptr::addr_of!(view_projection).cast(),
-            );
-            gl.bind_vertex_array(self.vao);
+        let mut advance_x = 0.0;
+        let mut prev_adv = 0.0;
 
-            gl.draw_elements(
-                gl::Primitive::TRIANGLES,
-                cube::INDICES
-                    .len()
-                    .try_into()
-                    .expect("indices should fit the count"),
-                ElementKind::UNSIGNED_BYTE,
-                std::ptr::null(),
-            );
+        for char in text.chars() {
+            if char.is_whitespace() {
+                advance_x += self.font.white_space;
+                continue;
+            }
+
+            let glyph = self.font.glyph(char).unwrap();
+
+            let m = glam::Mat4::from_translation(vec3(
+                advance_x + glyph.offset.x,
+                self.font.font_size - glyph.size.y - glyph.offset.y,
+                0.0,
+            )) * glam::Mat4::from_scale(vec3(glyph.size.x, glyph.size.y, 1.0));
+
+            let view_projection = projection * view * m;
+            advance_x += glyph.advance.x;
+            prev_adv = glyph.advance.x;
+
+            unsafe {
+                gl.uniform_matrix4_fv(
+                    1,
+                    1,
+                    gl::GLboolean::FALSE,
+                    std::ptr::addr_of!(view_projection).cast(),
+                );
+                gl.bind_vertex_array(self.vao);
+                gl.uniform1_i(0, 0);
+
+                let uv = vec4(
+                    glyph.position.x,
+                    glyph.position.y,
+                    glyph.bitmap_size.x,
+                    glyph.bitmap_size.y,
+                );
+                gl.uniform4_fv(6, 1, addr_of!(uv).cast());
+
+                gl.draw_arrays(Primitive::TRIANGLE_STRIP, 0, 4);
+            }
         }
     }
 }
@@ -268,21 +423,37 @@ const VS: &str = "
 #version 430
 layout(location = 0) in vec3 pos;
  
-layout(location = 0) uniform mat4 vp;
+layout(location = 1) uniform mat4 vp;
+layout(location = 6) uniform vec4 uv;
 
 out vec3 vertex_color;
+out vec2 vertex_uv;
+
 void main() {
-    vertex_color = pos + vec3(0.5, 0.5, 0.5);
-    gl_Position = vp * vec4(pos.x, pos.y, pos.z, 1.0);
+
+    vec2 vertices[4] = {
+        vec2(0.0, 0.0),  //TL
+        vec2(1.0, 0.0),  //TR
+        vec2(0.0, 1.0),  //BL
+        vec2(1.0, 1.0),  //BR
+    };
+
+    vec2 vertex = vertices[gl_VertexID];
+    vertex_uv = uv.xy + vertex.xy * uv.zw;
+
+    gl_Position = vp * vec4(vertex.x, vertex.y, -1.0, 1.0);
 }";
 
 const FS: &str = "
 #version 430
 
+layout(location = 0) uniform sampler2D sampler;
+
 in vec3 vertex_color;
+in vec2 vertex_uv;
 
 out vec4 color;
 
 void main() {
-    color = vec4(vertex_color, 1.0);
+    color = texture(sampler, vertex_uv);
 }";
