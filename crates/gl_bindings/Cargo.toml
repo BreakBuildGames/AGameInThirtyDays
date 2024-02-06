@@ -1,0 +1,19 @@
+[package]
+name = "gl_bindings"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+
+[lints]
+workspace = true
+
+[dependencies]
+log.workspace = true
+
+
+[dev-dependencies]
+glfw.workspace = true
+image.workspace = true
+env_logger.workspace = true

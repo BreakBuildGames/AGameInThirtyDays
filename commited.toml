@@ -1,0 +1,7 @@
+style="conventional"
+subject_capitalized = false 
+imperative_subject = true
+subject_not_punctudated = true 
+line_length = 0 
+subject_length = 72
+allowed_types = ["build", "fix", "feat", "chore", "docs", "style", "refactor", "perf", "test"]

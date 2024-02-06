@@ -1,0 +1,16 @@
+name: Lint Commits
+
+on: 
+    pull_request:
+  
+jobs:
+  Commitlint:
+     name: Check conventional commits
+     runs-on: ubuntu-latest
+     steps: 
+        - uses: actions/checkout@v3
+          with: 
+             fetch-depth: 0
+        - uses: crate-ci/committed@master
+          with:
+              args: "-v --config commited.toml"  
