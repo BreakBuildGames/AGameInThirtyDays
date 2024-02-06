@@ -26,6 +26,8 @@ fn main() -> anyhow::Result<(), anyhow::Error> {
 
     let mut renderer = renderer::Renderer::new(&|s| glfw.get_proc_address_raw(s))?;
 
+    let mut dt = 0.0;
+
     while !window.should_close() {
         glfw.poll_events();
         for (_, event) in glfw::flush_messages(&events) {
@@ -34,7 +36,8 @@ fn main() -> anyhow::Result<(), anyhow::Error> {
             }
         }
 
-        renderer.update();
+        dt += 0.01;
+        renderer.update(dt);
         window.swap_buffers();
     }
 

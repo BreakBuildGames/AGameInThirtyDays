@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::{ffi::c_void, fmt::Display};
 
 pub use super::types::{
     GLbitField, GLboolean, GLchar, GLenum, GLfloat, GLint, GLsizei, GLsizeiptr, GLuint,
@@ -38,6 +38,23 @@ impl Buffer {}
 pub struct Capability(GLenum);
 impl Capability {
     pub const DEBUG_OUTPUT: Self = Self(0x92E0);
+    pub const DEPTH: Self = Self(0x0B71);
+    pub const CULL_FACE: Self = Self(0x0B44);
+}
+
+#[repr(transparent)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub struct DepthFunc(GLenum);
+
+impl DepthFunc {
+    pub const NEVER: Self = Self(0x0200);
+    pub const LESS: Self = Self(0x0201);
+    pub const EQUAL: Self = Self(0x0202);
+    pub const LEQUAL: Self = Self(0x0203);
+    pub const GREATER: Self = Self(0x0204);
+    pub const NOTEQUAL: Self = Self(0x0205);
+    pub const GEQUAL: Self = Self(0x0206);
+    pub const ALWAYS: Self = Self(0x0207);
 }
 
 #[repr(transparent)]
@@ -114,6 +131,16 @@ pub struct Primitive(GLenum);
 impl Primitive {
     pub const TRIANGLES: Self = Self(0x4);
     pub const TRIANGLE_STRIP: Self = Self(0x0005);
+}
+
+#[repr(transparent)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub struct ElementKind(GLenum);
+
+impl ElementKind {
+    pub const UNSIGNED_BYTE: Self = Self(0x1401);
+    pub const UNSIGNED_SHORT: Self = Self(0x1403);
+    pub const UNSIGNED_INT: Self = Self(0x1405);
 }
 
 #[repr(transparent)]
@@ -378,10 +405,19 @@ pub struct Api {
     //
     //state
     enable_ptr: unsafe extern "system" fn(cap: Capability),
+    disable_ptr: unsafe extern "system" fn(cap: Capability),
+    depth_func_ptr: unsafe extern "system" fn(func: DepthFunc),
     clear_ptr: unsafe extern "system" fn(mask: ClearMask),
     clear_color_ptr: unsafe extern "system" fn(r: GLfloat, g: GLfloat, b: GLfloat, a: GLfloat),
     viewport_ptr: unsafe extern "system" fn(x: GLint, y: GLint, width: GLsizei, height: GLsizei),
     //draw
+    //
+    draw_elements_ptr: unsafe extern "system" fn(
+        mode: Primitive,
+        count: GLsizei,
+        kinds: ElementKind,
+        indices: *const c_void,
+    ),
     draw_arrays_ptr: unsafe extern "system" fn(mode: Primitive, first: GLint, count: GLsizei),
     //vertex arrays
     bind_vertex_array_ptr: unsafe extern "system" fn(array: VertexArray),
@@ -500,10 +536,13 @@ impl Api {
             //
             //state
             enable_ptr: loader.load("glEnable")?,
+            disable_ptr: loader.load("glDisable")?,
+            depth_func_ptr: loader.load("glDepthFunc")?,
             clear_ptr: loader.load("glClear")?,
             clear_color_ptr: loader.load("glClearColor")?,
             viewport_ptr: loader.load("glViewport")?,
             //draw
+            draw_elements_ptr: loader.load("glDrawElements")?,
             draw_arrays_ptr: loader.load("glDrawArrays")?,
             //vertex arrays
             gen_vertex_arrays_ptr: loader.load("glGenVertexArrays")?,
@@ -545,7 +584,7 @@ impl Api {
             tex_image_2d_ptr: loader.load("glTexImage2D")?,
             delete_textures_ptr: loader.load("glDeleteTexture")?,
 
-            //samplers
+            //sampler
             gen_samplers_ptr: loader.load("glGenSamplers")?,
             bind_samplers_ptr: loader.load("glBindSampler")?,
             sampler_parameter_i_ptr: loader.load("glSamplerParameteri")?,
@@ -645,6 +684,36 @@ impl Api {
         unsafe { (self.enable_ptr)(cap) }
     }
 
+    /// Enables certain state or context capabilities.
+    ///
+    /// # Safety
+    /// The caller has to make sure that the OpenGL context that loaded the functions
+    /// is made current for the thread calling the functions.
+    ///
+    /// Also, unfortunately, some drivers return wrong addresses that are indistinguishable from correct
+    /// ones, instead of being null pointers. That means if the context doesn't support certain
+    /// OpenGL functions, there is no way to figure that out during load time.
+    // STATE
+    #[inline]
+    pub unsafe fn disable(&self, cap: Capability) {
+        unsafe { (self.disable_ptr)(cap) }
+    }
+
+    /// Enables certain state or context capabilities.
+    ///
+    /// # Safety
+    /// The caller has to make sure that the OpenGL context that loaded the functions
+    /// is made current for the thread calling the functions.
+    ///
+    /// Also, unfortunately, some drivers return wrong addresses that are indistinguishable from correct
+    /// ones, instead of being null pointers. That means if the context doesn't support certain
+    /// OpenGL functions, there is no way to figure that out during load time.
+    // STATE
+    #[inline]
+    pub unsafe fn depth_func(&self, func: DepthFunc) {
+        unsafe { (self.depth_func_ptr)(func) }
+    }
+
     /// Sets the clear color
     ///
     /// # Safety
@@ -695,6 +764,24 @@ impl Api {
     #[inline]
     pub unsafe fn draw_arrays(&self, mode: Primitive, start: GLint, count: GLsizei) {
         unsafe { (self.draw_arrays_ptr)(mode, start, count) }
+    }
+
+    /// # Safety
+    /// The caller has to make sure that the OpenGL context that loaded the functions
+    /// is made current for the thread calling the functions.
+    ///
+    /// Also, unfortunately, some drivers return wrong addresses that are indistinguishable from correct
+    /// ones, instead of being null pointers. That means if the context doesn't support certain
+    /// OpenGL functions, there is no way to figure that out during load time.
+    #[inline]
+    pub unsafe fn draw_elements(
+        &self,
+        mode: Primitive,
+        count: GLsizei,
+        kind: ElementKind,
+        indices: *const c_void,
+    ) {
+        unsafe { (self.draw_elements_ptr)(mode, count, kind, indices) }
     }
 
     // VERTEX ARRAYS
