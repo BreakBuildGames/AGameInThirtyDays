@@ -24,9 +24,11 @@ fn main() -> anyhow::Result<(), anyhow::Error> {
     window.make_current();
     window.set_key_polling(true);
 
+    glfw.set_swap_interval(glfw::SwapInterval::None);
+
     let mut renderer = renderer::Renderer::new(&|s| glfw.get_proc_address_raw(s))?;
 
-    let mut dt = 0.0;
+    let mut timer = std::time::Instant::now();
 
     while !window.should_close() {
         glfw.poll_events();
@@ -36,9 +38,11 @@ fn main() -> anyhow::Result<(), anyhow::Error> {
             }
         }
 
-        dt += 0.01;
-        renderer.update(dt);
+        let current_time = std::time::Instant::now();
+        let dt = current_time - timer;
+        renderer.update(dt.as_secs_f32());
         window.swap_buffers();
+        timer = current_time;
     }
 
     Ok(())

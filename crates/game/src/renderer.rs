@@ -1,43 +1,364 @@
-use std::{char, mem::MaybeUninit, ptr::addr_of};
+use gl_bindings::gl43 as gl;
 
-use gl_bindings::gl43::{
-    self as gl, AttributeComponents, Border, BufferTarget, BufferUsage, ElementKind,
-    InternalFormat, Primitive, SamplerParameterName, SamplerParameterValue, TextureDataFormat,
-    TextureFormat, TextureTarget, TextureUnit, VertexAttributeKind,
-};
-use glam::{vec2, vec3, vec4, Vec2};
+use glam::{vec3, Vec3};
 
 use crate::color32;
 
-mod attribute {
-    use super::gl;
+mod text {
+    use std::{mem::MaybeUninit, ptr::addr_of};
 
-    pub const POSITION: gl::AttributeIndex = gl::AttributeIndex::new(0);
-}
+    use gl_bindings::gl43::{
+        self as gl, Border, InternalFormat, Primitive, Program, SamplerParameterName,
+        SamplerParameterValue, Texture, TextureDataFormat, TextureFormat, TextureTarget,
+        TextureUnit, VertexArray,
+    };
+    use glam::{vec2, vec3, vec4, Vec2, Vec3};
 
-pub struct Renderer {
-    gl: gl::Api,
-    vao: gl::VertexArray,
-    vbo: gl::Buffer,
-    ibo: gl::Buffer,
-    texture: gl::Texture,
-    sampler: gl::Sampler,
-    program: gl::Program,
-    font: Font,
-}
+    use crate::color32;
 
-impl Drop for Renderer {
-    fn drop(&mut self) {
-        unsafe {
-            self.gl.delete_buffer(self.vbo);
-            self.gl.delete_buffer(self.ibo);
-            self.gl.delete_vertex_arrays(1, [self.vao].as_ptr());
-            self.gl.delete_program(self.program);
+    use super::{create_shader_program, FS, VS};
+
+    pub struct Renderer {
+        vao: VertexArray,
+        program: Program,
+        textures: Vec<Texture>,
+        fonts: Vec<Font>,
+        texts: Vec<Text>,
+        draw_list: Vec<(usize, color32::Linear32, Vec3)>,
+    }
+
+    impl Renderer {
+        pub fn new(gl: &gl::Api) -> Self {
+            let vao = unsafe {
+                let mut vao = MaybeUninit::zeroed();
+                gl.gen_vertex_arrays(1, vao.as_mut_ptr());
+                vao.assume_init()
+            };
+            let program = create_shader_program(gl, VS, FS);
+
+            Self {
+                fonts: Vec::with_capacity(10),
+                texts: Vec::with_capacity(100),
+                textures: Vec::with_capacity(10),
+                draw_list: Vec::with_capacity(100),
+                vao,
+                program,
+            }
+        }
+
+        pub fn load_font_from_memory(
+            &mut self,
+            gl: &gl::Api,
+            font_size: f32,
+            data: &[u8],
+            char_set: impl Iterator<Item = char>,
+        ) -> Result<usize, FontLoadingError> {
+            let (font, atlas) = Font::load_font(font_size, data, char_set)?;
+            self.fonts.push(font);
+
+            let (texture, sampler) = unsafe {
+                let mut texture = MaybeUninit::zeroed();
+                gl.gen_textures(1, texture.as_mut_ptr());
+                let texture = texture.assume_init();
+
+                gl.active_texture(TextureUnit::ZERO);
+
+                gl.bind_texture(TextureTarget::TEXTURE_2D, texture);
+                gl.tex_image_2d(
+                    TextureTarget::TEXTURE_2D,
+                    0,
+                    InternalFormat::RGB8,
+                    Font::ATLAS_SIZE.try_into().unwrap(),
+                    Font::ATLAS_SIZE.try_into().unwrap(),
+                    Border::ZERO,
+                    TextureFormat::RGB,
+                    TextureDataFormat::U8,
+                    atlas.as_ptr().cast(),
+                );
+
+                let mut sampler = MaybeUninit::zeroed();
+                gl.gen_samplers(1, sampler.as_mut_ptr());
+                let sampler = sampler.assume_init();
+
+                gl.bind_sampler(0, sampler);
+                gl.sampler_parameter_i(
+                    sampler,
+                    SamplerParameterName::TEXTURE_MIN_FILTER,
+                    SamplerParameterValue::LINEAR,
+                );
+
+                (texture, sampler)
+            };
+            Ok(self.fonts.len() - 1)
+        }
+
+        pub fn create_text(
+            &mut self,
+            font_handle: usize,
+            position: Vec3,
+            content: &str,
+        ) -> Result<usize, CharacterNotFound> {
+            let Some(font) = self.fonts.get(font_handle) else {
+                return Err(todo!());
+            };
+
+            let text = Text::new(font, position, content)?;
+            self.texts.push(text);
+            Ok(self.texts.len() - 1)
+        }
+
+        pub fn draw(&mut self, text_handle: usize, color: color32::Linear32, position: Vec3) {
+            //TODO: error handling for resources
+            self.draw_list.push((text_handle, color, position));
+        }
+
+        pub fn update(&mut self, gl: &gl::Api) {
+            unsafe {
+                gl.enable(gl::Capability::DEPTH);
+                gl.disable(gl::Capability::CULL_FACE);
+                gl.depth_func(gl::DepthFunc::LEQUAL);
+            }
+
+            let projection = glam::Mat4::orthographic_lh(0.0, 1024.0, 768.0, 0.0, 0.01, 100.0);
+            let view = glam::Mat4::IDENTITY;
+
+            unsafe {
+                gl.use_program(self.program);
+            }
+
+            for (handle, color, position) in self.draw_list.drain(..) {
+                let text = self.texts.get(handle).unwrap();
+
+                for (p, u, s) in text
+                    .positions
+                    .iter()
+                    .zip(text.uvs.iter())
+                    .zip(text.scales.iter())
+                    .map(|((p, u), s)| (p, u, s))
+                {
+                    let m = glam::Mat4::from_translation(*p + position);
+                    let s = glam::Mat4::from_scale(*s);
+
+                    let view_projection = projection * view * m * s;
+
+                    unsafe {
+                        gl.uniform_matrix4_fv(
+                            1,
+                            1,
+                            gl::GLboolean::FALSE,
+                            std::ptr::addr_of!(view_projection).cast(),
+                        );
+                        gl.uniform4_fv(6, 1, addr_of!(*u).cast());
+                        gl.uniform4_fv(7, 1, addr_of!(color).cast());
+                    }
+
+                    unsafe {
+                        gl.bind_vertex_array(self.vao);
+                        gl.uniform1_i(0, 0);
+                        gl.draw_arrays(Primitive::TRIANGLE_STRIP, 0, 4);
+                    }
+                }
+            }
+        }
+    }
+
+    pub struct Font {
+        glyphs: Vec<Glyph>,
+        size: f32,
+        white_space: f32,
+    }
+
+    pub struct Text {
+        global: Vec3,
+        positions: Vec<glam::Vec3>,
+        uvs: Vec<glam::Vec4>,
+        scales: Vec<glam::Vec3>,
+    }
+
+    #[derive(Debug)]
+    pub struct CharacterNotFound(char);
+
+    #[derive(Debug)]
+    pub enum FontLoadingError {
+        CharacterNotFound(char),
+        FontInvalid,
+    }
+
+    impl std::error::Error for FontLoadingError {}
+    impl std::error::Error for CharacterNotFound {}
+
+    impl std::fmt::Display for FontLoadingError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::CharacterNotFound(char) => {
+                    write!(f, "character {char} not found")
+                }
+                FontLoadingError::FontInvalid => write!(f, "invalid font"),
+            }
+        }
+    }
+
+    impl std::fmt::Display for CharacterNotFound {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "character {} not found", self.0)
+        }
+    }
+
+    impl Text {
+        pub fn new(font: &Font, position: Vec3, content: &str) -> Result<Self, CharacterNotFound> {
+            let mut advance_x = 0.0;
+            let mut advance_y = 0.0;
+
+            let mut positions = Vec::with_capacity(content.len());
+            let mut scales = Vec::with_capacity(content.len());
+            let mut uvs = Vec::with_capacity(content.len());
+
+            for char in content.chars() {
+                if char.is_whitespace() {
+                    if char == ' ' {
+                        advance_x += font.white_space;
+                    } else if char == '\n' {
+                        advance_x = 0.0;
+                        advance_y += font.size;
+                    }
+                    continue;
+                }
+
+                let glyph = font.glyph(char).ok_or(CharacterNotFound(char))?;
+
+                let position = vec3(
+                    advance_x + glyph.offset.x,
+                    advance_y + font.size - glyph.size.y - glyph.offset.y,
+                    0.0,
+                );
+
+                let scale = vec3(glyph.size.x, glyph.size.y, 1.0);
+                let uv = vec4(
+                    glyph.position.x,
+                    glyph.position.y,
+                    glyph.bitmap_size.x,
+                    glyph.bitmap_size.y,
+                );
+
+                positions.push(position);
+                scales.push(scale);
+                uvs.push(uv);
+
+                advance_x += glyph.advance.x;
+            }
+            Ok(Self {
+                positions,
+                uvs,
+                scales,
+                global: position,
+            })
+        }
+    }
+
+    struct Glyph {
+        position: Vec2,
+        bitmap_size: Vec2,
+        size: Vec2,
+        advance: Vec2,
+        offset: Vec2,
+        char: char,
+    }
+
+    impl Font {
+        pub const ATLAS_SIZE: usize = 1024;
+
+        pub fn glyph(&self, char: char) -> Option<&Glyph> {
+            self.glyphs.iter().find(|v| v.char == char)
+        }
+
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        pub fn load_font(
+            font_size: f32,
+            data: &[u8],
+            char_set: impl Iterator<Item = char>,
+        ) -> Result<(Self, Vec<u8>), FontLoadingError> {
+            let font = fontdue::Font::from_bytes(data, fontdue::FontSettings::default())
+                .map_err(|e| FontLoadingError::FontInvalid)?;
+
+            let white_space = font.metrics(' ', font_size).advance_width;
+
+            let padding = 2;
+            let mut atlas = vec![0; Self::ATLAS_SIZE * Self::ATLAS_SIZE];
+
+            let mut pen_x = 0;
+            let mut pen_y = 0;
+
+            let mut glyphs = Vec::with_capacity(Self::ATLAS_SIZE);
+
+            for char in char_set {
+                if !font.has_glyph(char) {
+                    return Err(FontLoadingError::CharacterNotFound(char));
+                }
+                let (metrics, pixel_data) = font.rasterize(char, font_size);
+
+                if pen_x + metrics.width > Self::ATLAS_SIZE {
+                    pen_x = 0;
+                    pen_y += font_size as usize;
+                }
+
+                for y in 0..metrics.height {
+                    let start = pen_x + (pen_y + y) * Self::ATLAS_SIZE;
+                    atlas.splice(
+                        start..(start + metrics.width),
+                        pixel_data[y * metrics.width..][..metrics.width]
+                            .iter()
+                            .copied(),
+                    );
+                }
+
+                let uv_x = pen_x as f32 / Self::ATLAS_SIZE as f32;
+                let uv_y = pen_y as f32 / Self::ATLAS_SIZE as f32;
+
+                let width = (metrics.width) as f32 / Self::ATLAS_SIZE as f32;
+                let height = (metrics.height) as f32 / Self::ATLAS_SIZE as f32;
+
+                glyphs.push(Glyph {
+                    position: vec2(uv_x, uv_y),
+                    advance: vec2(metrics.advance_width, font_size),
+                    bitmap_size: vec2(width, height),
+                    size: vec2(metrics.width as f32, metrics.height as f32),
+
+                    offset: vec2(metrics.xmin as f32, metrics.ymin as f32),
+                    char,
+                });
+
+                pen_x += metrics.width + padding;
+            }
+            //TODO: single channel texture support
+            let data = atlas.into_iter().flat_map(|v| [v, v, v]).collect();
+            let font = Self {
+                glyphs,
+                size: font_size,
+                white_space,
+            };
+
+            Ok((font, data))
         }
     }
 }
 
-const FONT: &[u8] = include_bytes!("../resources/montserrat.ttf");
+pub struct Renderer {
+    gl: gl::Api,
+    text_renderer: text::Renderer,
+    text: usize,
+}
+
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        unsafe {}
+    }
+}
+
+const FONT: &[u8] = include_bytes!("../resources/recursive.ttf");
 
 mod cube {
     #[rustfmt::skip]
@@ -112,88 +433,6 @@ fn create_shader_program(gl: &gl::Api, vextex_source: &str, fragment_source: &st
     }
 }
 
-struct Font {
-    glyphs: Vec<Glyph>,
-    font_size: f32,
-    white_space: f32,
-}
-
-struct Glyph {
-    position: Vec2,
-    bitmap_size: Vec2,
-    size: Vec2,
-    advance: Vec2,
-    offset: Vec2,
-    char: char,
-}
-
-impl Font {
-    pub const ATLAS_SIZE: usize = 1024;
-
-    pub fn glyph(&self, char: char) -> Option<&Glyph> {
-        self.glyphs.iter().find(|v| v.char == char)
-    }
-
-    pub fn load_font(
-        font_size: f32,
-        data: &[u8],
-        char_set: impl Iterator<Item = char>,
-    ) -> (Self, Vec<u8>) {
-        let font = fontdue::Font::from_bytes(data, fontdue::FontSettings::default()).unwrap();
-        let white_space = font.metrics(' ', font_size).advance_width;
-
-        let padding = 2;
-        let mut atlas = vec![0; Self::ATLAS_SIZE * Self::ATLAS_SIZE];
-
-        let mut pen_x = 0;
-        let mut pen_y = 0;
-
-        let mut glyphs = Vec::with_capacity(Self::ATLAS_SIZE);
-
-        for char in char_set {
-            let (metrics, pixel_data) = font.rasterize(char, font_size);
-
-            if pen_x + metrics.width > Self::ATLAS_SIZE {
-                pen_x = 0;
-                pen_y += font_size as usize;
-            }
-
-            for x in 0..metrics.width {
-                for y in 0..metrics.height {
-                    atlas[pen_x + x + ((pen_y + y) * Self::ATLAS_SIZE)] =
-                        pixel_data[x + y * metrics.width];
-                }
-            }
-
-            let uv_x = pen_x as f32 / Self::ATLAS_SIZE as f32;
-            let uv_y = pen_y as f32 / Self::ATLAS_SIZE as f32;
-
-            let width = (metrics.width) as f32 / Self::ATLAS_SIZE as f32;
-            let height = (metrics.height) as f32 / Self::ATLAS_SIZE as f32;
-
-            glyphs.push(Glyph {
-                position: vec2(uv_x, uv_y),
-                advance: vec2(metrics.advance_width, font_size),
-                bitmap_size: vec2(width, height),
-                size: vec2(metrics.width as f32, metrics.height as f32),
-                offset: vec2(metrics.xmin as f32, metrics.ymin as f32),
-                char,
-            });
-
-            pen_x += metrics.width + padding;
-        }
-        //TODO: single channl texture support
-        let data = atlas.into_iter().flat_map(|v| [v, v, v]).collect();
-        let font = Self {
-            font_size,
-            glyphs,
-            white_space: white_space as f32,
-        };
-
-        (font, data)
-    }
-}
-
 impl Renderer {
     pub fn new(
         proc_address: &impl Fn(&str) -> *const std::ffi::c_void,
@@ -210,189 +449,50 @@ impl Renderer {
             gl.clear_color(r, g, b, a);
         }
 
-        let vertex_array = unsafe {
-            let mut vao = MaybeUninit::zeroed();
-            gl.gen_vertex_arrays(1, vao.as_mut_ptr());
-            vao.assume_init()
-        };
+        let mut text_renderer = text::Renderer::new(&gl);
 
-        let vertex_buffer = unsafe {
-            let mut vbo = MaybeUninit::zeroed();
-            gl.gen_buffers(1, vbo.as_mut_ptr());
-            let vbo = vbo.assume_init();
-
-            gl.bind_buffer(BufferTarget::ARRAY_BUFFER, vbo);
-            gl.buffer_data(
-                BufferTarget::ARRAY_BUFFER,
-                std::mem::size_of_val(cube::VERTICES)
-                    .try_into()
-                    .expect("vertex count should never reach the limit"),
-                cube::VERTICES.as_ptr().cast(),
-                BufferUsage::STATIC_DRAW,
-            );
-
-            vbo
-        };
-
-        let index_buffer = unsafe {
-            let mut ibo = MaybeUninit::zeroed();
-            gl.gen_buffers(1, ibo.as_mut_ptr());
-            let ibo = ibo.assume_init();
-
-            gl.bind_vertex_array(vertex_array);
-
-            gl.bind_buffer(BufferTarget::ELEMENT_ARRAY_BUFFER, ibo);
-            gl.buffer_data(
-                BufferTarget::ELEMENT_ARRAY_BUFFER,
-                std::mem::size_of_val(cube::INDICES)
-                    .try_into()
-                    .expect("element count should never reach the limit"),
-                cube::INDICES.as_ptr().cast(),
-                BufferUsage::STATIC_DRAW,
-            );
-
-            ibo
-        };
-
-        unsafe {
-            gl.bind_vertex_array(vertex_array);
-            gl.enable_vertex_attrib_array(attribute::POSITION);
-
-            gl.vertex_attrib_format_ptr(
-                attribute::POSITION,
-                AttributeComponents::THREE,
-                VertexAttributeKind::FLOAT,
-                gl::GLboolean::FALSE,
-                0,
-            );
-
-            let vbo_index = gl::BufferBindingIndex::new(0);
-
-            gl.bind_vertex_buffer(
-                vbo_index,
-                vertex_buffer,
-                0,
-                (std::mem::size_of::<f32>() * 3)
-                    .try_into()
-                    .expect("should always fit"),
-            );
-            gl.vertex_attrib_binding(attribute::POSITION, vbo_index);
-        }
-
-        unsafe {
-            gl.enable(gl::Capability::DEPTH);
-            gl.disable(gl::Capability::CULL_FACE);
-            gl.depth_func(gl::DepthFunc::LEQUAL);
-        }
-
-        let program = create_shader_program(&gl, VS, FS);
-
-        let (font, font_atlas) = Font::load_font(
+        let font_handle = text_renderer.load_font_from_memory(
+            &gl,
             72.0,
             FONT,
-            ('a'..='z').chain('A'..='Z').chain(".,-_+/=()".chars()),
-        );
+            ('a'..='z')
+                .chain('A'..='Z')
+                .chain('0'..='9')
+                .chain(".,-_+/=()!".chars()),
+        )?;
 
-        let (texture, sampler) = unsafe {
-            let mut texture = MaybeUninit::zeroed();
-            gl.gen_textures(1, texture.as_mut_ptr());
-            let texture = texture.assume_init();
-
-            gl.active_texture(TextureUnit::ZERO);
-            gl.bind_texture(TextureTarget::TEXTURE_2D, texture);
-            gl.tex_image_2d(
-                TextureTarget::TEXTURE_2D,
-                0,
-                InternalFormat::RGB8,
-                Font::ATLAS_SIZE.try_into().unwrap(),
-                Font::ATLAS_SIZE.try_into().unwrap(),
-                Border::ZERO,
-                TextureFormat::RGB,
-                TextureDataFormat::U8,
-                font_atlas.as_ptr().cast(),
-            );
-
-            let mut sampler = MaybeUninit::zeroed();
-            gl.gen_samplers(1, sampler.as_mut_ptr());
-            let sampler = sampler.assume_init();
-
-            gl.bind_sampler(0, sampler);
-            gl.sampler_parameter_i(
-                sampler,
-                SamplerParameterName::TEXTURE_MIN_FILTER,
-                SamplerParameterValue::LINEAR,
-            );
-
-            (texture, sampler)
-        };
+        let text = text_renderer.create_text(font_handle, Vec3::ZERO, "nrseitrnie")?;
 
         Ok(Self {
             gl,
-            vao: vertex_array,
-            vbo: vertex_buffer,
-            ibo: index_buffer,
-            program,
-            texture,
-            sampler,
-            font,
+            text_renderer,
+            text,
         })
     }
 
     pub fn update(&mut self, dt: f32) {
         let gl = &self.gl;
 
-        let text = "The quick brown fox...";
-
-        let projection = glam::Mat4::orthographic_lh(0.0, 1024.0, 768.0, 0.0, -0.01, -100.0);
-        let view = glam::Mat4::IDENTITY;
-
         unsafe {
             gl.clear(gl::ClearMask::ALL);
-            gl.use_program(self.program);
         }
 
-        let mut advance_x = 0.0;
-        let mut prev_adv = 0.0;
+        self.text_renderer
+            .draw(self.text, color32::Linear32::GREEN, Vec3::ZERO);
 
-        for char in text.chars() {
-            if char.is_whitespace() {
-                advance_x += self.font.white_space;
-                continue;
-            }
+        self.text_renderer.draw(
+            self.text,
+            color32::Linear32::YELLOW,
+            vec3(200.0, 350.0, 0.0),
+        );
 
-            let glyph = self.font.glyph(char).unwrap();
+        self.text_renderer.draw(
+            self.text,
+            color32::Linear32::DARK_JUNGLE_GREEN,
+            vec3(500.0, 500.0, 0.0),
+        );
 
-            let m = glam::Mat4::from_translation(vec3(
-                advance_x + glyph.offset.x,
-                self.font.font_size - glyph.size.y - glyph.offset.y,
-                0.0,
-            )) * glam::Mat4::from_scale(vec3(glyph.size.x, glyph.size.y, 1.0));
-
-            let view_projection = projection * view * m;
-            advance_x += glyph.advance.x;
-            prev_adv = glyph.advance.x;
-
-            unsafe {
-                gl.uniform_matrix4_fv(
-                    1,
-                    1,
-                    gl::GLboolean::FALSE,
-                    std::ptr::addr_of!(view_projection).cast(),
-                );
-                gl.bind_vertex_array(self.vao);
-                gl.uniform1_i(0, 0);
-
-                let uv = vec4(
-                    glyph.position.x,
-                    glyph.position.y,
-                    glyph.bitmap_size.x,
-                    glyph.bitmap_size.y,
-                );
-                gl.uniform4_fv(6, 1, addr_of!(uv).cast());
-
-                gl.draw_arrays(Primitive::TRIANGLE_STRIP, 0, 4);
-            }
-        }
+        self.text_renderer.update(gl);
     }
 }
 
@@ -421,8 +521,6 @@ extern "system" fn debug_message_callback(
 
 const VS: &str = "
 #version 430
-layout(location = 0) in vec3 pos;
- 
 layout(location = 1) uniform mat4 vp;
 layout(location = 6) uniform vec4 uv;
 
@@ -448,6 +546,7 @@ const FS: &str = "
 #version 430
 
 layout(location = 0) uniform sampler2D sampler;
+layout(location = 7) uniform vec4 in_color;
 
 in vec3 vertex_color;
 in vec2 vertex_uv;
@@ -455,5 +554,5 @@ in vec2 vertex_uv;
 out vec4 color;
 
 void main() {
-    color = texture(sampler, vertex_uv);
+    color = texture(sampler, vertex_uv).r * in_color;
 }";
