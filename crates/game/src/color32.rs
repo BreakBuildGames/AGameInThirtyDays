@@ -66,3 +66,9 @@ impl Linear32 {
         [self.r, self.g, self.b, self.a]
     }
 }
+
+impl From<[f32; 4]> for Linear32 {
+    fn from([r, g, b, a]: [f32; 4]) -> Self {
+        Self { r, g, b, a }
+    }
+}

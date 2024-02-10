@@ -200,6 +200,22 @@ impl AttributeComponents {
     //return value).
 }
 
+impl TryFrom<u8> for AttributeComponents {
+    type Error = ();
+    fn try_from(value: u8) -> Result<Self, ()> {
+        match value {
+            1 => Ok(Self::ONE),
+            2 => Ok(Self::TWO),
+            3 => Ok(Self::THREE),
+            4 => Ok(Self::FOUR),
+            n => {
+                println!("{n}");
+                Err(())
+            }
+        }
+    }
+}
+
 /// Bindings to a curated subset of OpenGL 4.3
 unsafe impl Send for Api {}
 unsafe impl Sync for Api {}
@@ -418,6 +434,13 @@ pub struct Api {
         kinds: ElementKind,
         indices: *const c_void,
     ),
+    draw_elements_base_vertex_ptr: unsafe extern "system" fn(
+        mode: Primitive,
+        count: GLsizei,
+        kinds: ElementKind,
+        indices: *const c_void,
+        base_vertex: GLint,
+    ),
     draw_arrays_ptr: unsafe extern "system" fn(mode: Primitive, first: GLint, count: GLsizei),
     //vertex arrays
     bind_vertex_array_ptr: unsafe extern "system" fn(array: VertexArray),
@@ -543,6 +566,7 @@ impl Api {
             viewport_ptr: loader.load("glViewport")?,
             //draw
             draw_elements_ptr: loader.load("glDrawElements")?,
+            draw_elements_base_vertex_ptr: loader.load("glDrawElementsBaseVertex")?,
             draw_arrays_ptr: loader.load("glDrawArrays")?,
             //vertex arrays
             gen_vertex_arrays_ptr: loader.load("glGenVertexArrays")?,
@@ -782,6 +806,25 @@ impl Api {
         indices: *const c_void,
     ) {
         unsafe { (self.draw_elements_ptr)(mode, count, kind, indices) }
+    }
+
+    /// # Safety
+    /// The caller has to make sure that the OpenGL context that loaded the functions
+    /// is made current for the thread calling the functions.
+    ///
+    /// Also, unfortunately, some drivers return wrong addresses that are indistinguishable from correct
+    /// ones, instead of being null pointers. That means if the context doesn't support certain
+    /// OpenGL functions, there is no way to figure that out during load time.
+    #[inline]
+    pub unsafe fn draw_elements_base_vertex(
+        &self,
+        mode: Primitive,
+        count: GLsizei,
+        kind: ElementKind,
+        indices: *const c_void,
+        base_vertex: GLint,
+    ) {
+        unsafe { (self.draw_elements_base_vertex_ptr)(mode, count, kind, indices, base_vertex) }
     }
 
     // VERTEX ARRAYS

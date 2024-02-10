@@ -15,12 +15,16 @@ suspicious = "warn"
 suspicious_docs = "allow"
 missing_errors_doc = "allow"
 
+[profile.dev]
+opt-level = 1             
+
 
 [workspace.dependencies]
 gl_bindings = { path = "crates/gl_bindings" }
 glfw = "0.54.0"
 anyhow = "1.0.79" 
 glam = "0.25.0"
+gltf = "1.4.0"
 
 # handy utils
 log = "0.4.20"
