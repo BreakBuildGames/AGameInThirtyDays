@@ -1,22 +1,24 @@
-use std::mem::MaybeUninit;
+use gl_bindings::gl43::{
+    self as gl, AttributeComponents, AttributeIndex, BufferBindingIndex, BufferUsage,
+};
+use glam::Mat4;
+use std::{borrow::Borrow, mem::MaybeUninit, usize};
 
-use gl_bindings::gl43::{self as gl, AttributeComponents, AttributeIndex, BufferUsage};
+use crate::{color32, GameState};
 
-use ::gltf::texture;
-use glam::{vec3, Vec3};
-
-use crate::color32;
+use self::gfx::VertexLayout;
 
 mod gfx;
 mod gltf;
+
+mod mesh;
 mod text;
 
 pub struct Renderer {
     gl: gl::Api,
     text_renderer: text::Renderer,
-    text: usize,
-    vaos: Vec<gl::VertexArray>,
-    vbos: Vec<gl::Buffer>,
+    vao: gl::VertexArray,
+    gl_buffers: Vec<gl::Buffer>,
     textures: Vec<gl::Texture>,
     samplers: Vec<gl::Sampler>,
     meshes: Vec<MeshView>,
@@ -27,12 +29,17 @@ const FONT: &[u8] = include_bytes!("../resources/recursive.ttf");
 
 #[derive(Debug)]
 struct MeshView {
-    vao_index: usize,
-    count: usize,
-    indices: usize,
-    offset: usize,
-    index_buffer_index: Option<usize>,
+    vertices: usize,
+    vertex_offset: usize,
+    indices: Option<MeshIndices>,
     base_index: usize,
+}
+
+#[derive(Debug)]
+struct MeshIndices {
+    count: usize,
+    offset: usize,
+    kind: gfx::IndexKind,
 }
 
 struct MeshMaterial {}
@@ -106,12 +113,44 @@ fn create_shader_program(gl: &gl::Api, vextex_source: &str, fragment_source: &st
         gl.delete_shader(vs);
         gl.delete_shader(fs);
 
+        gl.use_program(program);
+
         program
     }
 }
 
+fn create_vao(gl: &gl::Api, layout: &VertexLayout) -> gl::VertexArray {
+    let vao = unsafe {
+        let mut vao = MaybeUninit::zeroed();
+        gl.gen_vertex_arrays(1, vao.as_mut_ptr());
+        let vao = vao.assume_init();
+        gl.bind_vertex_array(vao);
+        vao
+    };
+
+    for attribute in &layout.attributes {
+        let location = gl::AttributeIndex::new(attribute.location.into());
+
+        unsafe {
+            gl.enable_vertex_attrib_array(location);
+            gl.vertex_attrib_format_ptr(
+                location,
+                attribute.kind.components().try_into().unwrap(),
+                attribute.kind.into(),
+                attribute.normalized.into(),
+                attribute.offset.try_into().unwrap(),
+            );
+
+            gl.vertex_attrib_binding(
+                location,
+                BufferBindingIndex::new(attribute.buffer.try_into().unwrap()),
+            );
+        }
+    }
+    vao
+}
+
 impl Renderer {
-    #[allow(clippy::too_many_lines)]
     pub fn new(
         proc_address: &impl Fn(&str) -> *const std::ffi::c_void,
     ) -> anyhow::Result<Self, anyhow::Error> {
@@ -129,105 +168,122 @@ impl Renderer {
 
         let mut text_renderer = text::Renderer::new(&gl);
 
-        let scene = gltf::Scene::load_from_memory(include_bytes!("../resources/Avocado.glb"));
+        let config = gltf::Config::default();
+        let vao = create_vao(&gl, &config.vertex_layout);
+
+        //let scene =
+        //gltf::load_from_memory(&config, include_bytes!("../resources/Avocado.glb")).unwrap();
+
+        //let scene = gltf::load_from_memory(
+        //&config,
+        //include_bytes!("../resources/ferris/ferris3d_v1.0.glb"),
+        //)
+        //.unwrap();
         let scene =
-            gltf::Scene::load_from_memory(include_bytes!("../resources/ferris/ferris3d_v1.0.glb"));
-        //let scene = gltf::Scene::load_from_file("crates/game/resources/gura/scene.gltf");
+            gltf::load_from_file(&config, "crates/game/resources/shibahu/scene.gltf").unwrap();
 
-        let mut buffers = Vec::with_capacity(scene.buffers().len());
-
-        let mut vaos = Vec::with_capacity(scene.meshes().len());
-        let mut meshes = Vec::with_capacity(scene.meshes().len());
-
-        let vao = unsafe {
-            let mut vao = MaybeUninit::zeroed();
-            gl.gen_vertex_arrays(1, vao.as_mut_ptr());
-            let vao = vao.assume_init();
-            gl.bind_vertex_array(vao);
-            vao
+        let Some(meshes) = scene.meshes else {
+            panic!();
         };
-        vaos.push(vao);
 
-        let mut buffer_data: Vec<u8> = Vec::new();
-        let mut index_data: Vec<u8> = Vec::new();
+        let mut vertex_buffers: Vec<Vec<u8>> =
+            Vec::with_capacity(config.vertex_layout.buffers.len());
+
+        for i in 0..config.vertex_layout.buffers.len() {
+            vertex_buffers.push(Vec::new());
+        }
+
+        let mut index_buffer: Vec<u8> = Vec::new();
+
         let mut base_index = 0;
+        let mut mesh_handles = Vec::with_capacity(meshes.len());
 
-        for mesh in scene.meshes() {
+        for mesh in meshes {
             println!("{:?}", mesh.name);
-            meshes.push(MeshView {
-                vao_index: 0,
-                count: mesh.indices.as_ref().unwrap().count,
-                indices: index_data.len(),
-                offset: buffer_data.len(),
-                index_buffer_index: mesh.indices.as_ref().map(|v| 1),
+
+            mesh_handles.push(MeshView {
                 base_index,
+                vertices: mesh.vertices.count,
+                indices: mesh.indices.as_ref().map(|indices| MeshIndices {
+                    count: indices.count,
+                    offset: index_buffer.len(),
+                    kind: indices.kind,
+                }),
+                vertex_offset: 0,
             });
 
-            buffer_data.extend(&mesh.position_buffer);
-            index_data.extend(&mesh.indices.as_ref().unwrap().data);
-            base_index += mesh.vertex_count;
+            for (index, buffer_range) in mesh.vertices.buffers.iter().enumerate() {
+                let chunk = &scene.data[buffer_range.clone()];
+                vertex_buffers[index].extend(chunk);
+            }
+
+            if let Some(index) = mesh.indices {
+                index_buffer.extend(index.data);
+            }
+
+            base_index += mesh.vertices.count;
         }
 
-        let mut gl_buffer = unsafe {
-            let mut buffer = MaybeUninit::zeroed();
-            gl.gen_buffers(1, buffer.as_mut_ptr());
-            buffer.assume_init()
-        };
+        let mut gl_buffers: Vec<_> = config
+            .vertex_layout
+            .buffers
+            .iter()
+            .map(|buffer| unsafe {
+                let mut gl_buffer = MaybeUninit::zeroed();
+                gl.gen_buffers(1, gl_buffer.as_mut_ptr());
+                let gl_buffer = gl_buffer.assume_init();
 
-        unsafe {
-            gl.bind_buffer(gl::BufferTarget::ARRAY_BUFFER, gl_buffer);
-            gl.buffer_data(
-                gl::BufferTarget::ARRAY_BUFFER,
-                (buffer_data.len() * std::mem::size_of::<u8>())
-                    .try_into()
-                    .unwrap(),
-                buffer_data.as_ptr().cast(),
-                BufferUsage::STATIC_DRAW,
-            );
+                gl.bind_buffer(gl::BufferTarget::ARRAY_BUFFER, gl_buffer);
+                gl.buffer_data(
+                    gl::BufferTarget::ARRAY_BUFFER,
+                    (vertex_buffers[buffer.buffer].len() * std::mem::size_of::<u8>())
+                        .try_into()
+                        .unwrap(),
+                    vertex_buffers[buffer.buffer].as_ptr().cast(),
+                    BufferUsage::STATIC_DRAW,
+                );
+
+                gl_buffer
+            })
+            .collect();
+
+        for b in &config.vertex_layout.buffers {
+            unsafe {
+                let location = gl::BufferBindingIndex::new(b.buffer.try_into().unwrap());
+                gl.bind_vertex_buffer(
+                    location,
+                    gl_buffers[b.buffer],
+                    0,
+                    match b.stride {
+                        gfx::Stride::Packed => config
+                            .vertex_layout
+                            .buffer_vertex_size(b.buffer)
+                            .try_into()
+                            .unwrap(),
+                        gfx::Stride::Inverleaved(n) => n.try_into().unwrap(),
+                    },
+                );
+            }
         }
-        buffers.push(gl_buffer);
-
-        let gl_buffer = unsafe {
-            let mut buffer = MaybeUninit::zeroed();
-            gl.gen_buffers(1, buffer.as_mut_ptr());
-            buffer.assume_init()
-        };
 
         unsafe {
+            let mut gl_buffer = MaybeUninit::zeroed();
+            gl.gen_buffers(1, gl_buffer.as_mut_ptr());
+            let gl_buffer = gl_buffer.assume_init();
+
             gl.bind_buffer(gl::BufferTarget::ELEMENT_ARRAY_BUFFER, gl_buffer);
+
             gl.buffer_data(
                 gl::BufferTarget::ELEMENT_ARRAY_BUFFER,
-                (index_data.len() * std::mem::size_of::<u8>())
+                (index_buffer.len() * std::mem::size_of::<u8>())
                     .try_into()
                     .unwrap(),
-                index_data.as_ptr().cast(),
+                index_buffer.as_ptr().cast(),
                 BufferUsage::STATIC_DRAW,
             );
-        }
-        buffers.push(gl_buffer);
 
-        let location = AttributeIndex::new(0);
-        let components = AttributeComponents::THREE;
-
-        unsafe {
-            gl.enable_vertex_attrib_array(location);
-            gl.vertex_attrib_format_ptr(
-                location,
-                components,
-                gl::VertexAttributeKind::FLOAT,
-                gl::GLboolean::FALSE,
-                0,
-            );
-
-            let buffer_binding = gl::BufferBindingIndex::new(0);
-            gl.vertex_attrib_binding(location, buffer_binding);
-            gl.bind_vertex_buffer(
-                buffer_binding,
-                buffers[0],
-                0,
-                (3 * std::mem::size_of::<f32>()).try_into().unwrap(),
-            );
-        }
+            gl_buffers.push(gl_buffer);
+        };
 
         let font_handle = text_renderer.load_font_from_memory(
             &gl,
@@ -239,50 +295,54 @@ impl Renderer {
                 .chain(".,-_+/=()!".chars()),
         )?;
 
-        let text = text_renderer.create_text(font_handle, Vec3::ZERO, "nrseitrnie")?;
-
         let textures = Vec::new();
         let samplers = Vec::new();
         let materials = Vec::new();
 
         Ok(Self {
             gl,
-            text,
             text_renderer,
-            vaos,
-            vbos: buffers,
-            meshes,
+            vao,
+            gl_buffers,
+            meshes: mesh_handles,
             textures,
             samplers,
             materials,
         })
     }
 
-    pub fn update(&mut self, dt: f32) {
+    pub fn update(&mut self, dt: f32, game_state: &mut GameState) {
         let gl = &self.gl;
 
         unsafe {
             gl.clear(gl::ClearMask::ALL);
-            gl.bind_vertex_array(self.vaos[0]);
+            gl.bind_vertex_array(self.vao);
+
+            let vp = game_state.camera.view_projection();
+            gl.uniform_matrix4_fv(1, 1, gl::GLboolean::FALSE, std::ptr::addr_of!(vp).cast());
         }
 
         for mesh in &self.meshes {
             unsafe {
-                match mesh.index_buffer_index {
+                match &mesh.indices {
                     Some(index) => {
                         gl.draw_elements_base_vertex(
                             gl::Primitive::TRIANGLES,
-                            mesh.count.try_into().unwrap(),
-                            gl::ElementKind::UNSIGNED_SHORT,
-                            mesh.indices as *const _,
+                            index.count.try_into().unwrap(),
+                            match index.kind {
+                                gfx::IndexKind::U8 => gl::ElementKind::UNSIGNED_BYTE,
+                                gfx::IndexKind::U16 => gl::ElementKind::UNSIGNED_SHORT,
+                                gfx::IndexKind::U32 => gl::ElementKind::UNSIGNED_INT,
+                            },
+                            index.offset as *const _,
                             mesh.base_index.try_into().unwrap(),
                         );
                     }
                     None => {
                         gl.draw_arrays(
                             gl::Primitive::TRIANGLES,
-                            mesh.offset.try_into().unwrap(),
-                            mesh.count.try_into().unwrap(),
+                            mesh.vertex_offset.try_into().unwrap(),
+                            mesh.vertices.try_into().unwrap(),
                         );
                     }
                 }
@@ -319,9 +379,9 @@ extern "system" fn debug_message_callback(
 const VS: &str = "
 #version 430
 layout(location = 0) in vec3 position;
+layout(location = 1) in vec2 uv;
 
 layout(location = 1) uniform mat4 vp;
-layout(location = 6) uniform vec4 uv;
 
 out vec3 vertex_color;
 out vec2 vertex_uv;
@@ -329,9 +389,9 @@ out vec2 vertex_uv;
 void main() {
 
     vec3 vertex = position.xyz;
-    vertex_uv = uv.xy + vertex.xy * uv.zw;
+    vertex_uv = uv;
 
-    gl_Position = vec4(vertex.x, vertex.y, vertex.z, 1.0);
+    gl_Position = vp * vec4(vertex.x, vertex.y, vertex.z, 1.0);
 }";
 
 const FS: &str = "
